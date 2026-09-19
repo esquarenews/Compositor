@@ -29,6 +29,8 @@ nonisolated struct BrushPatch: @unchecked Sendable {
 /// Shared top-left raster drawing, including coverage without color conversion.
 nonisolated enum BrushRaster {
     static func context(width: Int, height: Int, mask: Bool) throws -> CGContext {
+        // Sparse documents may exceed this area; materialized bitmaps may not.
+        guard width > 0, height > 0, width <= 100_000_000 / height else { throw ProjectError.tooLarge }
         guard let result = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
             bytesPerRow: width * (mask ? 1 : 4),
             space: mask ? CGColorSpaceCreateDeviceGray() : CGColorSpace(name: CGColorSpace.sRGB)!,
@@ -305,7 +307,7 @@ final class BrushStroke {
         return result
     }
 
-    private func continuousKeys(_ segments: [SIMD4<Float>]) -> Set<Int> {
+    private func continuousKeys(_ segments: [SIMD4<Float>]) throws -> Set<Int> {
         var keys = Set<Int>()
         let reach = settings.diameter / 2 + 2
         let inverse = pixelToDocument.inverted()
@@ -317,9 +319,11 @@ final class BrushStroke {
             guard !box.isNull, !box.isEmpty else { continue }
             let affected = box.applying(inverse).integral.intersection(CGRect(x: 0, y: 0, width: width, height: height))
             guard !affected.isNull, !affected.isEmpty else { continue }
+            _ = try checkedCandidateBounds(affected)
             for y in Int(affected.minY) / Self.tileSize...Int(ceil(affected.maxY) - 1) / Self.tileSize {
                 for x in Int(affected.minX) / Self.tileSize...Int(ceil(affected.maxX) - 1) / Self.tileSize {
                     keys.insert(y * columns + x)
+                    guard keys.count <= 4096 else { throw ProjectError.tooLarge }
                 }
             }
         }
@@ -328,8 +332,8 @@ final class BrushStroke {
 
     private func renderContinuous(settled: [SIMD4<Float>], tail: [SIMD4<Float>]) throws {
         guard let gpu else { return }
-        let tailKeys = continuousKeys(tail)
-        let changed = continuousKeys(settled).union(tailKeys).union(gpuTailKeys)
+        let tailKeys = try continuousKeys(tail)
+        let changed = try continuousKeys(settled).union(tailKeys).union(gpuTailKeys)
         let columns = (width + Self.tileSize - 1) / Self.tileSize
         var work: [(MetalBrushCoverage.Tile, CGRect, CGContext)] = []
         for key in changed {
@@ -355,6 +359,7 @@ final class BrushStroke {
         if !box.isNull, !box.isEmpty {
             let affected = box.applying(pixelToDocument.inverted()).integral.intersection(CGRect(x: 0, y: 0, width: width, height: height))
             if !affected.isNull, !affected.isEmpty {
+                _ = try checkedCandidateBounds(affected)
                 let columns = (width + Self.tileSize - 1) / Self.tileSize
                 for y in Int(affected.minY) / Self.tileSize...Int(ceil(affected.maxY) - 1) / Self.tileSize {
                     for x in Int(affected.minX) / Self.tileSize...Int(ceil(affected.maxX) - 1) / Self.tileSize {
@@ -562,13 +567,32 @@ final class BrushStroke {
         }
     }
 
+    /// Admission precedes Set/dictionary construction on both Metal and software paths.
+    func checkedCandidateBounds(_ affected: CGRect) throws -> CGRect {
+        guard [affected.minX, affected.minY, affected.maxX, affected.maxY].allSatisfy(\.isFinite),
+              !affected.isNull, !affected.isEmpty else { throw ProjectError.tooLarge }
+        let size = CGFloat(Self.tileSize)
+        let x = floor(affected.minX / size) * size, y = floor(affected.minY / size) * size
+        let bounds = CGRect(x: x, y: y, width: min(CGFloat(width), ceil(affected.maxX / size) * size) - x,
+                            height: min(CGFloat(height), ceil(affected.maxY / size) * size) - y)
+        // Bookkeeping includes a small halo that need not allocate raster pixels.
+        // Keep its independent work cap separate from allocateTile's actual pixel budget.
+        let columns = ceil(bounds.width / size), rows = ceil(bounds.height / size)
+        guard columns > 0, rows > 0, columns * rows <= 4096 else { throw ProjectError.tooLarge }
+        return bounds
+    }
+
+    private func checkAllocationBounds(_ bounds: CGRect) throws {
+        guard bounds.width > 0, bounds.height > 0, bounds.width <= 30_000, bounds.height <= 30_000,
+              bounds.width * bounds.height <= CGFloat(pixelLimit) else { throw ProjectError.tooLarge }
+    }
+
     private func allocateTile(_ key: Int, x: Int, y: Int) throws {
         guard tiles[key] == nil else { return }
         let size = Self.tileSize
         let rect = CGRect(x: x * size, y: y * size, width: min(size, width - x * size), height: min(size, height - y * size))
         let nextBounds = allocatedBounds.map { $0.union(rect) } ?? (source == nil ? rect : sourceRect.union(rect))
-        guard nextBounds.width <= 30_000, nextBounds.height <= 30_000,
-              nextBounds.width * nextBounds.height <= CGFloat(pixelLimit) else { throw ProjectError.tooLarge }
+        try checkAllocationBounds(nextBounds)
         allocatedBounds = nextBounds
         let context = try BrushRaster.context(width: Int(rect.width), height: Int(rect.height), mask: isMask)
         if let raster = (isMask ? layer.mask?.asset.raster : layer.asset?.raster) {
@@ -756,7 +780,7 @@ final class BrushStroke {
     /// Spot Healing, once the stroke ends: rebuilds the painted area from nearby texture
     /// (`HealPixels.c`) and writes it into the stroke's tiles, so the usual commit applies it as
     /// one undo step. Reads the layer's original pixels, never the dark wash shown while painting.
-    func heal() throws {
+    func heal(maximumWorkingBytes: Int = HealingMemory.maximumBytes) throws {
         guard settings.healing, !isMask else { return }
         var painted: CGRect?
         for (key, context) in coverage {
@@ -775,6 +799,7 @@ final class BrushStroke {
         let region = painted.insetBy(dx: -reach, dy: -reach)
             .intersection(CGRect(x: 0, y: 0, width: width, height: height)).integral
         let w = Int(region.width), h = Int(region.height)
+        try HealingMemory.check(width: w, height: h, maximumBytes: maximumWorkingBytes)
         let pixels = try BrushRaster.context(width: w, height: h, mask: false)
         let placed = sourceRect.offsetBy(dx: -region.minX, dy: -region.minY)
         if let raster = layer.asset?.raster { raster.draw(in: placed, context: pixels) }
